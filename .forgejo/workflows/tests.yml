@@ -1,0 +1,94 @@
+name: test
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+
+env:
+  GO111MODULE: "on"
+  GOPROXY: https://proxy.golang.org
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        include:
+          - job_name: Linux
+            go: 1.27.x
+            test_opts: ""
+          - job_name: Linux (race)
+            go: 1.27.x
+            test_opts: "-race"
+          - job_name: Linux
+            go: 1.26.x
+            test_opts: ""
+          - job_name: Linux
+            go: 1.25.x
+            test_opts: ""
+
+    name: ${{ matrix.job_name }} Go ${{ matrix.go }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out code
+        uses: https://data.forgejo.org/actions/checkout@v7
+
+      - name: Set up Go ${{ matrix.go }}
+        uses: https://data.forgejo.org/actions/setup-go@v7
+        with:
+          go-version: ${{ matrix.go }}
+          cache: false
+
+      - name: Install test dependencies
+        run: |
+          if [ "$(id -u)" -eq 0 ]; then
+            apt-get update
+            apt-get install -y build-essential fuse openssh-sftp-server unzip wget
+          else
+            sudo apt-get update
+            sudo apt-get install -y build-essential fuse openssh-sftp-server unzip wget
+          fi
+
+          go install github.com/restic/rest-server/cmd/rest-server@master
+
+          SEAWEEDFS_VERSION=4.47
+          mkdir -p "$HOME/bin"
+          case "$(uname -m)" in
+            x86_64) test_arch=amd64 ;;
+            arm64|aarch64) test_arch=arm64 ;;
+            *) echo "unsupported architecture $(uname -m)"; exit 1 ;;
+          esac
+          wget --no-verbose -O- "https://github.com/seaweedfs/seaweedfs/releases/download/${SEAWEEDFS_VERSION}/linux_${test_arch}.tar.gz" \
+            | tar -xzf - -C "$HOME/bin" weed
+
+          wget --no-verbose -O rclone.zip "https://downloads.rclone.org/rclone-current-linux-${test_arch}.zip"
+          unzip rclone.zip
+          cp rclone*/rclone "$HOME/bin"
+          chmod 755 "$HOME/bin/rclone"
+          rm -rf rclone*
+
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+          # Mount tests require the runner to expose /dev/fuse to the job.
+          if [ -r /dev/fuse ] && [ -w /dev/fuse ]; then
+            echo "RESTIC_TEST_FUSE=true" >> "$GITHUB_ENV"
+          else
+            echo "RESTIC_TEST_FUSE=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build with build.go
+        run: go run build.go
+
+      - name: Minimal test
+        timeout-minutes: 3
+        run: |
+          ./restic init
+          ./restic backup .
+        env:
+          RESTIC_REPOSITORY: ../testrepo
+          RESTIC_PASSWORD: password
+          RESTIC_DEBUG_STACKTRACE_SIGINT: "true"
+
+      - name: Run local tests
+        run: go test -cover ${{ matrix.test_opts }} ./...
